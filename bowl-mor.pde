@@ -1,15 +1,15 @@
 /*
  *
  * This application is a complex set of conditional statements which determine how
- * candlepin pinsetters run, and which mechanical components are allowed to go and 
- * when. There are 7 inputs, and 9 outputs. Each input represents a mechanical limit 
+ * candlepin pinsetters run, and which mechanical components are allowed to go and
+ * when. There are 7 inputs, and 9 outputs. Each input represents a mechanical limit
  * switch, which machine components trigger as they run to control the start/stop of
- * machine parts. There are 5 status LED outputs, and 4 solid state relay outputs. 
+ * machine parts. There are 5 status LED outputs, and 4 solid state relay outputs.
  *
- * When limit switches are triggered, the corresponding solid state relay will turn 
+ * When limit switches are triggered, the corresponding solid state relay will turn
  * on or off, thus performing mechanical work, and keeping the machine in sequence.
  *
- * This code implements software debouncing methods to correct mechanical switch bounces. 
+ * This code implements software debouncing methods to correct mechanical switch bounces.
  * Each switch is tuned to a specific debouncing interval. Inputs read as latching
  * switches have higher debouncing intervals, because the subroutines and
  * conditions which utilize them read their states as always ON do work, if not on, do not
@@ -23,42 +23,65 @@
 // Included libraries
 #include <Bounce.h>
 
-// Define HIGH and LOW to On and OFF to make more logical sense
-#define ON HIGH
-#define OFF LOW
+// Define HIGH and LOW to ON and OFF to make more logical sense
+constexpr uint8_t ON = HIGH;
+constexpr uint8_t OFF = LOW;
+constexpr uint16_t debounceMs = 130;
+constexpr uint8_t UNINITIALIZED_OUTPUT = 0xFF;
 
 // Switch inputs
-const int resetSwitch = 22;
-const int tubeStartSwitch = 24;
-const int sweepStopSwitch = 26;
-const int tubeStopSwitch = 28;
-const int liftStopSwitch = 30;
-const int pusherStopSwitch = 32;
+constexpr uint8_t resetSwitch = 22;
+constexpr uint8_t tubeStartSwitch = 24;
+constexpr uint8_t sweepStopSwitch = 26;
+constexpr uint8_t tubeStopSwitch = 28;
+constexpr uint8_t liftStopSwitch = 30;
+constexpr uint8_t pusherStopSwitch = 32;
 
 // Relay outputs
-const int sweepRelay = 23;
-const int tubeRelay = 25;
-const int pusherRelay = 27;
-const int liftRelay = 29;
+constexpr uint8_t sweepRelay = 23;
+constexpr uint8_t tubeRelay = 25;
+constexpr uint8_t pusherRelay = 27;
+constexpr uint8_t liftRelay = 29;
 
-// LED Outputs
-const int statusLED = 31;
+// LED output
+constexpr uint8_t statusLED = 31;
 
 // Software flip-flop variables
-boolean sweepStopFlop = false;
-boolean tubeStopFlop = false;
-boolean pusherStopFlop = false;
+bool sweepStopFlop = false;
+bool tubeStopFlop = false;
+bool pusherStopFlop = false;
 
-// Boolean variable to detect that the reset button has been pressed.
-boolean holdResetValue = false;
+// Detect that the reset button was pressed before the cycle completed.
+bool holdResetValue = false;
+
+uint8_t statusLedState = UNINITIALIZED_OUTPUT;
+uint8_t sweepRelayState = UNINITIALIZED_OUTPUT;
+uint8_t tubeRelayState = UNINITIALIZED_OUTPUT;
+uint8_t pusherRelayState = UNINITIALIZED_OUTPUT;
+uint8_t liftRelayState = UNINITIALIZED_OUTPUT;
 
 // Instantiate debouncing for every switch
-Bounce resetBounce = Bounce(resetSwitch, 130);
-Bounce sweepStopBounce = Bounce(sweepStopSwitch, 130);
-Bounce tubeStartBounce = Bounce(tubeStartSwitch, 130);
-Bounce tubeStopBounce = Bounce(tubeStopSwitch, 130);
-Bounce liftStopBounce = Bounce(liftStopSwitch, 130);
-Bounce pusherStopBounce = Bounce(pusherStopSwitch, 130);
+Bounce resetBounce = Bounce(resetSwitch, debounceMs);
+Bounce sweepStopBounce = Bounce(sweepStopSwitch, debounceMs);
+Bounce tubeStartBounce = Bounce(tubeStartSwitch, debounceMs);
+Bounce tubeStopBounce = Bounce(tubeStopSwitch, debounceMs);
+Bounce liftStopBounce = Bounce(liftStopSwitch, debounceMs);
+Bounce pusherStopBounce = Bounce(pusherStopSwitch, debounceMs);
+
+void startCycle();
+void startTubes();
+void stopSweep();
+void stopTubes();
+void stopLiftStartPusher();
+void stopLift();
+void stopPusherStartLift();
+
+inline void writeOutputIfChanged(const uint8_t pin, const uint8_t value, uint8_t &cachedState) {
+  if (cachedState != value) {
+    digitalWrite(pin, value);
+    cachedState = value;
+  }
+}
 
 void setup() {
   // Inputs
@@ -68,175 +91,157 @@ void setup() {
   pinMode(tubeStopSwitch, INPUT);
   pinMode(liftStopSwitch, INPUT);
   pinMode(pusherStopSwitch, INPUT);
-  
+
   // Outputs
   pinMode(statusLED, OUTPUT);
   pinMode(sweepRelay, OUTPUT);
   pinMode(liftRelay, OUTPUT);
   pinMode(pusherRelay, OUTPUT);
   pinMode(tubeRelay, OUTPUT);
-  
-  // Start the pin lift as a priority. This will start the lift on powerup,
-  // which allows it to be set low later on in the cycles. If started at beginning
-  // of loop(), it will always stay on, and be unable to set LOW without delay() 
-  digitalWrite(liftRelay, ON);
+
+  // Initialize outputs to known defaults.
+  writeOutputIfChanged(statusLED, OFF, statusLedState);
+  writeOutputIfChanged(sweepRelay, OFF, sweepRelayState);
+  writeOutputIfChanged(tubeRelay, OFF, tubeRelayState);
+  writeOutputIfChanged(pusherRelay, OFF, pusherRelayState);
+
+  // Start the pin lift as a priority.
+  writeOutputIfChanged(liftRelay, ON, liftRelayState);
 }
 
 // The main method
 void loop() {
-  // Make all debounce functions equal to readable variables
-  int resetValue = resetBounce.read();
-  int tubeStartValue = tubeStartBounce.read();
-  int sweepStopValue = sweepStopBounce.read();
-  int tubeStopValue = tubeStopBounce.read();
-  int liftStopValue = liftStopBounce.read();
-  int pusherStopValue = pusherStopBounce.read();
-
-  // Update the pin lift constantly, it can stop at any time in the cycle,
-  // this prevents pin override.
-  liftStopBounce.update();
-  
-  // Update the tubes to prevent override.
+  const bool resetChanged = resetBounce.update();
+  const bool tubeStartChanged = tubeStartBounce.update();
+  const bool sweepStopChanged = sweepStopBounce.update();
   tubeStopBounce.update();
-  
-  // Start the cycle if pusher has completed the cycle.
-  // If pusher has not completed the cycle, wait until it
-  // does, then automatically start the cycle again.
-  if(resetBounce.update()){
-    if(resetValue == ON && pusherStopFlop == true){
-      startCycle();
-    } 
-    else if(resetValue == ON && pusherStopFlop == false){
-      holdResetValue = true;
+  liftStopBounce.update();
+  const bool pusherStopChanged = pusherStopBounce.update();
 
-      digitalWrite(statusLED, ON);
+  // Read values after update() so decisions use current debounced state.
+  const int resetValue = resetBounce.read();
+  const int tubeStartValue = tubeStartBounce.read();
+  const int sweepStopValue = sweepStopBounce.read();
+  const int tubeStopValue = tubeStopBounce.read();
+  const int liftStopValue = liftStopBounce.read();
+  const int pusherStopValue = pusherStopBounce.read();
+
+  // Start the cycle if pusher has completed the cycle.
+  // If pusher has not completed the cycle, hold the request until complete.
+  if (resetChanged) {
+    if (resetValue == ON && pusherStopFlop) {
+      startCycle();
+    } else if (resetValue == ON && !pusherStopFlop) {
+      holdResetValue = true;
+      writeOutputIfChanged(statusLED, ON, statusLedState);
     }
   }
 
-  // Start the tubes if the tube start has been pressed, and
-  // the sweep is still in motion.
-  if(tubeStartBounce.update()){
-    if(tubeStartValue == ON && sweepStopFlop == false){
+  // Start the tubes if tube start has been pressed and sweep is still moving.
+  if (tubeStartChanged) {
+    if (tubeStartValue == ON && !sweepStopFlop) {
       startTubes();
     }
   }
 
-  // Stop the sweep if the sweep stop has been pressed,
-  // and the tubes are still in motion.
-  if(sweepStopBounce.update()){
-    if(sweepStopValue == ON && tubeStopFlop == false){
+  // Stop the sweep if sweep stop has been pressed and tubes are still moving.
+  if (sweepStopChanged) {
+    if (sweepStopValue == ON && !tubeStopFlop) {
       stopSweep();
     }
   }
 
-  // Stop the tubes if the tube stop has been pressed, and
-  // the sweep has stopped.S
-  if(tubeStopValue == ON && sweepStopFlop == true){
+  // Stop the tubes if tube stop has been pressed and sweep has stopped.
+  if (tubeStopValue == ON && sweepStopFlop) {
     stopTubes();
   }
-  // Stop the lift and start the pusher if the lift stop has been pressed,
-  // and the tubes have stopped.
-  if(liftStopValue == ON && tubeStopFlop == true){
+
+  // Stop lift and start pusher if lift stop has been pressed and tubes have stopped.
+  if (liftStopValue == ON && tubeStopFlop) {
     stopLiftStartPusher();
-  }
-  // If tubes have not stopped yet, wait to push.
-  else if(liftStopValue == ON && tubeStopFlop == false){
+  } else if (liftStopValue == ON && !tubeStopFlop) {
+    // If tubes have not stopped yet, only stop lift and wait.
     stopLift();
-
-    if(tubeStopFlop == true){
-      startPusher();
-    }
   }
 
-  // Stop the pusher and start the lift if pusher stop has been pressed.
-  if(pusherStopBounce.update()){
-    if(pusherStopValue == ON){
+  // Stop pusher and start lift if pusher stop has been pressed.
+  if (pusherStopChanged) {
+    if (pusherStopValue == ON) {
       stopPusherStartLift();
     }
   }
 }
 
 // Function to start the cycle.
-void startCycle(){
-  // Reset all flop variables to default 'false'.
+void startCycle() {
+  // Reset all flop variables to default false.
   sweepStopFlop = false;
   pusherStopFlop = false;
   tubeStopFlop = false;
 
   // Turn the status LED on.
-  digitalWrite(statusLED, ON);
+  writeOutputIfChanged(statusLED, ON, statusLedState);
 
   // Turn the sweep on.
-  digitalWrite(sweepRelay, ON);
+  writeOutputIfChanged(sweepRelay, ON, sweepRelayState);
 }
 
 // Function to start the tubes.
-void startTubes(){
-  
+void startTubes() {
   // Turn the tubes on.
-  digitalWrite(tubeRelay, ON);
+  writeOutputIfChanged(tubeRelay, ON, tubeRelayState);
 }
 
-// Function to stop the sweep
-void stopSweep(){
-  // Set sweep stop flop to true since switch was hit
+// Function to stop the sweep.
+void stopSweep() {
+  // Set sweep stop flop to true since switch was hit.
   sweepStopFlop = true;
 
   // Turn the sweep off.
-  digitalWrite(sweepRelay, OFF);
+  writeOutputIfChanged(sweepRelay, OFF, sweepRelayState);
 }
 
-// Function to stop the tubes
-void stopTubes(){
-  // Set tube stop flop to true since switch was hit
+// Function to stop the tubes.
+void stopTubes() {
+  // Set tube stop flop to true since switch was hit.
   tubeStopFlop = true;
 
-  // Turn the status LED off
-  digitalWrite(statusLED, OFF);
+  // Turn the status LED off.
+  writeOutputIfChanged(statusLED, OFF, statusLedState);
 
-  // Turn the tubes off
-  digitalWrite(tubeRelay, OFF);
+  // Turn the tubes off.
+  writeOutputIfChanged(tubeRelay, OFF, tubeRelayState);
 }
 
-// Function to stop the lift and start the pusher
-void stopLiftStartPusher(){
+// Function to stop the lift and start the pusher.
+void stopLiftStartPusher() {
   // Turn the lift off.
-  digitalWrite(liftRelay, OFF);
+  writeOutputIfChanged(liftRelay, OFF, liftRelayState);
 
   // Turn the pusher on.
-  digitalWrite(pusherRelay, ON);
+  writeOutputIfChanged(pusherRelay, ON, pusherRelayState);
 }
 
-// Function to only stop the lift
-void stopLift(){
-  // Turn the lift and lift LED off
-  digitalWrite(liftRelay, OFF);
+// Function to only stop the lift.
+void stopLift() {
+  // Turn the lift off.
+  writeOutputIfChanged(liftRelay, OFF, liftRelayState);
 }
 
-// Function to only start the pusher
-void startPusher(){
-  // Turn the pusher on
-  digitalWrite(pusherRelay, ON);
-}
-
-// Function to stop the pusher and start the lift
-void stopPusherStartLift(){
-  // Set the pusher stop flop to true since switch was hit
+// Function to stop the pusher and start the lift.
+void stopPusherStartLift() {
+  // Set pusher stop flop to true since switch was hit.
   pusherStopFlop = true;
 
   // Turn the pusher off.
-  digitalWrite(pusherRelay, OFF);
+  writeOutputIfChanged(pusherRelay, OFF, pusherRelayState);
 
   // Turn the lift on.
-  digitalWrite(liftRelay, ON);
+  writeOutputIfChanged(liftRelay, ON, liftRelayState);
 
-  // If the reset button was pressed prior to pusher completing
-  // the cycle, then start the cycle automatically.
-  if(holdResetValue == true){
-    // Set the hold reset value back to false since it's value has been received
-    holdResetValue = false;    
-
-    // Automatically start the cycle
+  // If reset was pressed before pusher completed, start cycle automatically.
+  if (holdResetValue) {
+    holdResetValue = false;
     startCycle();
   }
 }
